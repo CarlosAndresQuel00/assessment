@@ -1,10 +1,10 @@
-import { IsEmail, IsNotEmpty, IsString } from 'class-validator';
+import { IsEmail, IsString, Matches } from 'class-validator';
 
 export class ConfirmOrderDto {
   @IsString()
-  @IsNotEmpty({ message: 'El nombre es obligatorio' })
+  @Matches(/\S/, { message: 'El nombre es obligatorio' })
   name: string;
 
-  @IsEmail({}, { message: 'El correo no es válido' })
+  @IsEmail({}, { message: 'El correo electrónico no es válido' })
   email: string;
 }

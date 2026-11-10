@@ -2,7 +2,7 @@ import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { createStore } from '../store/store';
 import { APP_STORE } from '../store/store.constants';
-import { OrdersService, SERVICE_FEE_PERCENT } from './orders.service';
+import { OrdersService } from './orders.service';
 
 describe('OrdersService', () => {
   let service: OrdersService;
@@ -40,9 +40,8 @@ describe('OrdersService', () => {
         },
       ]);
       expect(order.subtotalCents).toBe(5000);
-      expect(order.feeCents).toBe(Math.round((5000 * SERVICE_FEE_PERCENT) / 100));
-      expect(order.totalCents).toBe(order.subtotalCents + order.feeCents);
       expect(order.feeCents).toBe(500);
+      expect(order.totalCents).toBe(5500);
     });
 
     it('computes the 10% fee with integer math (not floating-point prices)', () => {
@@ -52,8 +51,47 @@ describe('OrdersService', () => {
       });
 
       expect(order.subtotalCents).toBe(1800);
-      expect(order.feeCents).toBe(Math.round((1800 * SERVICE_FEE_PERCENT) / 100));
+      expect(order.feeCents).toBe(180);
       expect(order.totalCents).toBe(1980);
+    });
+
+    it('sums multiple ticket types into the subtotal, fee, and total', () => {
+      const order = service.create({
+        eventId: 'noche-salsa',
+        items: [
+          { ticketTypeId: 'salsa-general', quantity: 2 },
+          { ticketTypeId: 'salsa-vip', quantity: 1 },
+        ],
+      });
+
+      expect(order.subtotalCents).toBe(11000);
+      expect(order.feeCents).toBe(1100);
+      expect(order.totalCents).toBe(12100);
+      expect(order.status).toBe('pending');
+    });
+
+    it('rounds the fee and keeps every amount in integer cents', () => {
+      const ticketType = store.events
+        .find((event) => event.id === 'standup-uio')
+        ?.ticketTypes.find((type) => type.id === 'standup-mesa');
+
+      if (!ticketType) {
+        throw new Error('Expected standup-mesa fixture');
+      }
+
+      ticketType.priceCents = 1005;
+
+      const order = service.create({
+        eventId: 'standup-uio',
+        items: [{ ticketTypeId: 'standup-mesa', quantity: 1 }],
+      });
+
+      expect(order.subtotalCents).toBe(1005);
+      expect(order.feeCents).toBe(101);
+      expect(order.totalCents).toBe(1106);
+      expect(Number.isInteger(order.subtotalCents)).toBe(true);
+      expect(Number.isInteger(order.feeCents)).toBe(true);
+      expect(Number.isInteger(order.totalCents)).toBe(true);
     });
 
     it('decrements remaining inventory', () => {
@@ -123,6 +161,15 @@ describe('OrdersService', () => {
       ).toThrow(BadRequestException);
     });
 
+    it('rejects quantities lower than one', () => {
+      expect(() =>
+        service.create({
+          eventId: 'noche-salsa',
+          items: [{ ticketTypeId: 'salsa-general', quantity: 0 }],
+        }),
+      ).toThrow(BadRequestException);
+    });
+
     it('rejects duplicate ticketTypeId values', () => {
       expect(() =>
         service.create({
@@ -133,6 +180,60 @@ describe('OrdersService', () => {
           ],
         }),
       ).toThrow(BadRequestException);
+    });
+
+    it('does not decrement inventory when any item is invalid', () => {
+      expect(() =>
+        service.create({
+          eventId: 'noche-salsa',
+          items: [
+            { ticketTypeId: 'salsa-general', quantity: 1 },
+            { ticketTypeId: 'salsa-vip', quantity: 3 },
+          ],
+        }),
+      ).toThrow(BadRequestException);
+
+      const general = store.events
+        .find((event) => event.id === 'noche-salsa')
+        ?.ticketTypes.find((type) => type.id === 'salsa-general');
+
+      expect(general?.remaining).toBe(40);
+    });
+
+    it('prevents overselling when requests compete for the last inventory', async () => {
+      const vip = store.events
+        .find((event) => event.id === 'noche-salsa')
+        ?.ticketTypes.find((type) => type.id === 'salsa-vip');
+
+      if (!vip) {
+        throw new Error('Expected salsa-vip fixture');
+      }
+
+      vip.remaining = 2;
+      const request = () =>
+        service.create({
+          eventId: 'noche-salsa',
+          items: [{ ticketTypeId: 'salsa-vip', quantity: 2 }],
+        });
+
+      const results = await Promise.allSettled([
+        Promise.resolve().then(request),
+        Promise.resolve().then(request),
+      ]);
+
+      expect(
+        results.filter((result) => result.status === 'fulfilled'),
+      ).toHaveLength(1);
+      expect(
+        results.filter((result) => result.status === 'rejected'),
+      ).toHaveLength(1);
+      expect(
+        results.find((result) => result.status === 'rejected'),
+      ).toMatchObject({
+        reason: expect.any(BadRequestException),
+      });
+      expect(vip.remaining).toBe(0);
+      expect(store.orders.size).toBe(1);
     });
   });
 
@@ -181,6 +282,30 @@ describe('OrdersService', () => {
           email: 'otra@example.com',
         }),
       ).toThrow(BadRequestException);
+    });
+
+    it('keeps the ticket reservation when confirming or retrying confirmation', () => {
+      const pending = service.create({
+        eventId: 'standup-uio',
+        items: [{ ticketTypeId: 'standup-mesa', quantity: 2 }],
+      });
+      const ticketType = store.events
+        .find((event) => event.id === 'standup-uio')
+        ?.ticketTypes.find((type) => type.id === 'standup-mesa');
+
+      service.confirm(pending.id, {
+        name: 'Ana Pérez',
+        email: 'ana@example.com',
+      });
+
+      expect(() =>
+        service.confirm(pending.id, {
+          name: 'Otra Persona',
+          email: 'otra@example.com',
+        }),
+      ).toThrow(BadRequestException);
+      expect(ticketType?.remaining).toBe(23);
+      expect(store.orders.size).toBe(1);
     });
   });
 });
