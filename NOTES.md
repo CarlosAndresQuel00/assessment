@@ -62,9 +62,9 @@
 - `findById` y `confirm` también verifican el plazo de forma síncrona, por lo que una confirmación en o después de `expiresAt` no depende de que el callback del temporizador ya haya corrido.
 - Antes de validar disponibilidad para una orden nueva, el servicio barre reservas vencidas y recupera su inventario; esto cubre callbacks retrasados y permite reutilizar esas entradas inmediatamente.
 - La transición `pending -> expired` ocurre antes de liberar inventario; llamadas posteriores no pueden devolver las mismas entradas otra vez.
-- Confirmar antes del límite cambia a `confirmed`, conserva la reserva y cancela el temporizador pendiente.
-- Confirmar una orden expirada devuelve HTTP 400 con el mensaje `La orden expiró y las entradas reservadas fueron liberadas`.
-- La validación final comprobó que a los 14:59.999 la orden sigue `pending` y el inventario continúa reservado; al milisegundo siguiente pasa a `expired` y se libera una sola vez.
+- Confirmar antes del límite cambia a `confirmed`, reserva y cancela el temporizador pendiente.
+- Una orden expirada devuelve HTTP 400 con el mensaje `La orden expiró y las entradas reservadas fueron liberadas`.
+- La validación final comprobó que a los 14:59 la orden sigue `pending` y el inventario continúa reservado; al milisegundo siguiente pasa a `expired` y se libera una sola vez.
 - Se cubrió la carrera entre confirmación y expiración programadas para el mismo instante: el chequeo síncrono del plazo impide confirmar y la liberación sigue siendo idempotente.
 - Dos solicitudes que compiten por inventario recién liberado no pueden sobrevendérselo: solo una se crea y `remaining` nunca resulta negativo.
 - Se mantuvieron las validaciones, el cálculo del 10% y todos los importes en centavos.

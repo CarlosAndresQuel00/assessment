@@ -1,11 +1,12 @@
 import { yupResolver } from '@hookform/resolvers/yup';
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { Link, Navigate, useLocation, useNavigate } from 'react-router';
 import * as yup from 'yup';
 import {
   ConfirmOrderBody,
   CreateOrderBody,
+  confirmOrder,
   createOrder,
   eventById,
   useApiMutation,
@@ -31,10 +32,9 @@ const checkoutSchema: yup.ObjectSchema<ConfirmOrderBody> = yup.object({
     .required('El correo es obligatorio'),
 });
 
-type PendingConfirmation = {
+type Reservation = {
   orderId: string;
   expiresAt: string;
-  buyer: ConfirmOrderBody;
 };
 
 export function CheckoutPage() {
@@ -53,18 +53,32 @@ export function CheckoutPage() {
     { id: eventId },
     { enabled: Boolean(eventId) },
   );
-  const [pendingConfirmation, setPendingConfirmation] =
-    useState<PendingConfirmation | null>(null);
+  const reservationCreationStarted = useRef(false);
+  const [reservation, setReservation] = useState<Reservation | null>(null);
   const [reservationExpired, setReservationExpired] = useState(false);
   const onReservationExpired = useCallback(() => {
     setReservationExpired(true);
   }, []);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [confirmationError, setConfirmationError] = useState<string | null>(
+    null,
+  );
   const createMutation = useApiMutation<
     Order,
     Record<string, never>,
     CreateOrderBody
   >(createOrder);
+  const confirmArgs = useMemo(
+    () => ({ id: reservation?.orderId ?? '' }),
+    [reservation?.orderId],
+  );
+  const confirmMutation = useApiMutation<
+    Order,
+    { id: string },
+    ConfirmOrderBody
+  >(confirmOrder, confirmArgs, {
+    onSuccess: (order) => navigate(`/orders/${order.id}`),
+  });
   const {
     register,
     handleSubmit,
@@ -73,12 +87,78 @@ export function CheckoutPage() {
     resolver: yupResolver(checkoutSchema),
     defaultValues: { name: '', email: '' },
   });
+  const items = useMemo(
+    () =>
+      event && selection
+        ? resolveTicketSelections(
+            event,
+            selection.items.map(({ ticketTypeId, quantity }) => ({
+              ticketTypeId,
+              quantity,
+            })),
+          )
+        : [],
+    [event, selection],
+  );
+  const availabilityError = event
+    ? getTicketAvailabilityError(event, items)
+    : null;
+  const selectionIsCurrent = Boolean(
+    selection && items.length === selection.items.length,
+  );
+  const { mutate: createReservation, isPending: isCreatingReservation } =
+    createMutation;
+  const startReservation = useCallback(() => {
+    if (
+      !event ||
+      !selectionIsCurrent ||
+      availabilityError ||
+      reservationCreationStarted.current
+    ) {
+      return;
+    }
+
+    reservationCreationStarted.current = true;
+    setCreateError(null);
+    createReservation(
+      {
+        eventId: event.id,
+        items: items.map(({ ticketTypeId, quantity }) => ({
+          ticketTypeId,
+          quantity,
+        })),
+      },
+      {
+        onSuccess: (order) => {
+          setReservationExpired(false);
+          setReservation({
+            orderId: order.id,
+            expiresAt: order.expiresAt,
+          });
+        },
+        onError: (error) => {
+          reservationCreationStarted.current = false;
+          setCreateError(error.message);
+        },
+      },
+    );
+  }, [
+    availabilityError,
+    createReservation,
+    event,
+    items,
+    selectionIsCurrent,
+  ]);
+
+  useEffect(() => {
+    if (!isEventFetching) startReservation();
+  }, [isEventFetching, startReservation]);
 
   if (!selection?.items.length) {
     return <Navigate to="/" replace />;
   }
 
-  if (isEventPending || isEventFetching) {
+  if (isEventPending) {
     return (
       <main className="mx-auto max-w-5xl px-4 py-12 text-ink/60">
         Cargando checkout…
@@ -98,22 +178,15 @@ export function CheckoutPage() {
     );
   }
 
-  const items = resolveTicketSelections(
-    event,
-    selection.items.map(({ ticketTypeId, quantity }) => ({
-      ticketTypeId,
-      quantity,
-    })),
-  );
   const { subtotalCents, feeCents, totalCents } =
     calculateCheckoutTotals(items);
-  const availabilityError = getTicketAvailabilityError(event, items);
+  const activeAvailabilityError = reservation ? null : availabilityError;
   const isSubmitting =
     isFormSubmitting ||
-    createMutation.isPending ||
-    Boolean(pendingConfirmation);
+    isCreatingReservation ||
+    confirmMutation.isPending;
 
-  if (items.length !== selection.items.length) {
+  if (!selectionIsCurrent) {
     return (
       <main className="mx-auto max-w-5xl px-4 py-12">
         <p>Una de las entradas seleccionadas ya no está disponible.</p>
@@ -127,36 +200,29 @@ export function CheckoutPage() {
     );
   }
 
-  const onSubmit = handleSubmit(async (buyer) => {
-    setCreateError(null);
+  const onSubmit = handleSubmit((buyer) => {
+    setConfirmationError(null);
 
-    if (availabilityError) {
-      setCreateError(availabilityError);
+    if (activeAvailabilityError) {
+      setCreateError(activeAvailabilityError);
       return;
     }
 
-    try {
-      const order = await createMutation.mutateAsync({
-        eventId: event.id,
-        items: items.map(({ ticketTypeId, quantity }) => ({
-          ticketTypeId,
-          quantity,
-        })),
-      });
-
-      setReservationExpired(false);
-      setPendingConfirmation({
-        orderId: order.id,
-        expiresAt: order.expiresAt,
-        buyer,
-      });
-    } catch (error) {
-      setCreateError(
-        error instanceof Error
-          ? error.message
-          : 'No pudimos crear la orden. Intenta nuevamente.',
-      );
+    if (!reservation) {
+      setCreateError('Espera a que la reserva esté lista antes de confirmar.');
+      return;
     }
+
+    if (reservationExpired) {
+      setConfirmationError(
+        'La reserva expiró. Vuelve al evento para seleccionar entradas nuevamente.',
+      );
+      return;
+    }
+
+    confirmMutation.mutate(buyer, {
+      onError: (error) => setConfirmationError(error.message),
+    });
   });
   return (
     <main className="mx-auto max-w-5xl px-4 py-10">
@@ -169,22 +235,22 @@ export function CheckoutPage() {
 
       <div className="mt-6 grid gap-8 md:grid-cols-[1fr_280px]">
         <section className="relative rounded-2xl bg-white p-6 ring-1 ring-black/5">
-          {pendingConfirmation && (
+          {reservation && (
             <ReservationTimer
-              expiresAt={pendingConfirmation.expiresAt}
+              expiresAt={reservation.expiresAt}
               onExpired={onReservationExpired}
             />
           )}
           <h1
             className={`text-2xl font-semibold tracking-tight ${
-              pendingConfirmation ? 'pr-36' : ''
+              reservation ? 'pr-36' : ''
             }`}
           >
             Tus datos
           </h1>
           <p
             className={`mt-2 text-sm text-ink/70 ${
-              pendingConfirmation ? 'pr-36' : ''
+              reservation ? 'pr-36' : ''
             }`}
           >
             Completa el checkout para{' '}
@@ -234,35 +300,55 @@ export function CheckoutPage() {
               )}
             </div>
 
-            {(availabilityError || createError) && (
-              <p
+            {(activeAvailabilityError || createError) && (
+              <div
                 role="alert"
                 className="rounded-xl bg-red-50 px-4 py-3 text-sm text-red-800"
               >
-                {availabilityError ?? createError}
-              </p>
+                <p>{activeAvailabilityError ?? createError}</p>
+                {!activeAvailabilityError &&
+                  !reservation &&
+                  !isCreatingReservation && (
+                    <button
+                      type="button"
+                      className="mt-2 font-medium underline"
+                      onClick={startReservation}
+                    >
+                      Reintentar reserva
+                    </button>
+                  )}
+              </div>
             )}
 
             <button
               type="submit"
-              disabled={isSubmitting || Boolean(availabilityError)}
+              disabled={
+                isSubmitting ||
+                !reservation ||
+                reservationExpired ||
+                Boolean(activeAvailabilityError)
+              }
               className="w-full rounded-full bg-accent px-4 py-3 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {isSubmitting
-                ? 'Procesando…'
-                : availabilityError
-                  ? 'Entradas no disponibles'
-                  : `Pagar ${formatUsd(totalCents)}`}
+              {isCreatingReservation
+                ? 'Preparando reserva…'
+                : confirmMutation.isPending
+                  ? 'Confirmando compra…'
+                  : reservationExpired
+                    ? 'Reserva expirada'
+                    : activeAvailabilityError
+                      ? 'Entradas no disponibles'
+                      : !reservation
+                        ? 'Preparando reserva…'
+                        : `Pagar ${formatUsd(totalCents)}`}
             </button>
           </form>
 
-          {pendingConfirmation && (
+          {confirmationError && (
             <OrderConfirmation
-              orderId={pendingConfirmation.orderId}
-              expiresAt={pendingConfirmation.expiresAt}
-              buyer={pendingConfirmation.buyer}
-              expired={reservationExpired}
-              onConfirmed={(order) => navigate(`/orders/${order.id}`)}
+              orderId={reservation?.orderId ?? 'pendiente'}
+              error={confirmationError}
+              canRetry={Boolean(reservation && !reservationExpired)}
             />
           )}
         </section>
