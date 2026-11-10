@@ -2,18 +2,22 @@ import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { AddressInfo } from 'net';
 import { AppModule } from '../app.module';
+import { AppStore } from '../store/store';
+import { APP_STORE } from '../store/store.constants';
 
 type JsonObject = Record<string, unknown>;
 
 describe('Orders HTTP contract', () => {
   let app: INestApplication;
   let baseUrl: string;
+  let store: AppStore;
 
   beforeAll(async () => {
     const moduleRef = await Test.createTestingModule({
       imports: [AppModule],
     }).compile();
 
+    store = moduleRef.get(APP_STORE);
     app = moduleRef.createNestApplication();
     app.setGlobalPrefix('v1');
     app.useGlobalPipes(
@@ -68,6 +72,7 @@ describe('Orders HTTP contract', () => {
     });
     expect(order.id).toEqual(expect.stringMatching(/^ord_/));
     expect(order.createdAt).toEqual(expect.any(String));
+    expect(order.expiresAt).toEqual(expect.any(String));
   });
 
   it('returns HTTP 400 for sold-out tickets', async () => {
@@ -131,5 +136,42 @@ describe('Orders HTTP contract', () => {
 
     expect(response.status).toBe(404);
     expect(error.message).toBe('Orden no encontrada');
+  });
+
+  it('returns HTTP 400 and releases inventory for an expired order', async () => {
+    const vip = store.events
+      .find((event) => event.id === 'noche-salsa')
+      ?.ticketTypes.find((ticketType) => ticketType.id === 'salsa-vip');
+
+    if (!vip) {
+      throw new Error('Expected salsa-vip fixture');
+    }
+
+    const remainingBeforeOrder = vip.remaining;
+    const createResponse = await post('/orders', {
+      eventId: 'noche-salsa',
+      items: [{ ticketTypeId: 'salsa-vip', quantity: 1 }],
+    });
+    const pending = (await createResponse.json()) as JsonObject;
+    const storedOrder = store.orders.get(pending.id as string);
+
+    if (!storedOrder) {
+      throw new Error('Expected created order in store');
+    }
+
+    storedOrder.expiresAt = new Date(Date.now() - 1).toISOString();
+
+    const response = await post(`/orders/${storedOrder.id}/confirm`, {
+      name: 'Ana Pérez',
+      email: 'ana@example.com',
+    });
+    const error = (await response.json()) as JsonObject;
+
+    expect(response.status).toBe(400);
+    expect(error.message).toBe(
+      'La orden expiró y las entradas reservadas fueron liberadas',
+    );
+    expect(storedOrder.status).toBe('expired');
+    expect(vip.remaining).toBe(remainingBeforeOrder);
   });
 });

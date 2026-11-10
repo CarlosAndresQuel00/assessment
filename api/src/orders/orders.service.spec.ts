@@ -21,6 +21,10 @@ describe('OrdersService', () => {
     service = module.get(OrdersService);
   });
 
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
   describe('create', () => {
     it('creates a pending order with subtotal, 10% fee, and total in cents', () => {
       const order = service.create({
@@ -30,6 +34,9 @@ describe('OrdersService', () => {
 
       expect(order.status).toBe('pending');
       expect(order.buyer).toBeNull();
+      expect(Date.parse(order.expiresAt) - Date.parse(order.createdAt)).toBe(
+        15 * 60 * 1000,
+      );
       expect(order.items).toEqual([
         {
           ticketTypeId: 'salsa-general',
@@ -306,6 +313,215 @@ describe('OrdersService', () => {
       ).toThrow(BadRequestException);
       expect(ticketType?.remaining).toBe(23);
       expect(store.orders.size).toBe(1);
+    });
+  });
+
+  describe('expiration', () => {
+    const now = new Date('2026-11-10T12:00:00.000Z');
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+      jest.setSystemTime(now);
+    });
+
+    it('expires a pending order after 15 minutes and restores inventory', () => {
+      const order = service.create({
+        eventId: 'noche-salsa',
+        items: [{ ticketTypeId: 'salsa-vip', quantity: 2 }],
+      });
+      const vip = store.events
+        .find((event) => event.id === 'noche-salsa')
+        ?.ticketTypes.find((type) => type.id === 'salsa-vip');
+
+      expect(order.expiresAt).toBe('2026-11-10T12:15:00.000Z');
+      expect(vip?.remaining).toBe(6);
+
+      jest.advanceTimersByTime(15 * 60 * 1000 - 1);
+
+      expect(order.status).toBe('pending');
+      expect(vip?.remaining).toBe(6);
+
+      jest.advanceTimersByTime(1);
+
+      expect(order.status).toBe('expired');
+      expect(vip?.remaining).toBe(8);
+    });
+
+    it('releases inventory only once', () => {
+      const order = service.create({
+        eventId: 'noche-salsa',
+        items: [{ ticketTypeId: 'salsa-vip', quantity: 2 }],
+      });
+      const vip = store.events
+        .find((event) => event.id === 'noche-salsa')
+        ?.ticketTypes.find((type) => type.id === 'salsa-vip');
+
+      jest.advanceTimersByTime(15 * 60 * 1000);
+      service.findById(order.id);
+      jest.advanceTimersByTime(15 * 60 * 1000);
+
+      expect(order.status).toBe('expired');
+      expect(vip?.remaining).toBe(8);
+    });
+
+    it('expires an overdue order when it is queried before its timer runs', () => {
+      const order = service.create({
+        eventId: 'standup-uio',
+        items: [{ ticketTypeId: 'standup-mesa', quantity: 2 }],
+      });
+      const ticketType = store.events
+        .find((event) => event.id === 'standup-uio')
+        ?.ticketTypes.find((type) => type.id === 'standup-mesa');
+
+      jest.setSystemTime(new Date('2026-11-10T12:15:00.000Z'));
+
+      expect(service.findById(order.id).status).toBe('expired');
+      expect(ticketType?.remaining).toBe(25);
+    });
+
+    it('recovers expired inventory before checking a new order', () => {
+      const vip = store.events
+        .find((event) => event.id === 'noche-salsa')
+        ?.ticketTypes.find((type) => type.id === 'salsa-vip');
+
+      if (!vip) {
+        throw new Error('Expected salsa-vip fixture');
+      }
+
+      vip.remaining = 2;
+      const expired = service.create({
+        eventId: 'noche-salsa',
+        items: [{ ticketTypeId: 'salsa-vip', quantity: 2 }],
+      });
+      jest.setSystemTime(new Date('2026-11-10T12:15:00.000Z'));
+
+      const replacement = service.create({
+        eventId: 'noche-salsa',
+        items: [{ ticketTypeId: 'salsa-vip', quantity: 2 }],
+      });
+
+      expect(expired.status).toBe('expired');
+      expect(replacement.status).toBe('pending');
+      expect(vip.remaining).toBe(0);
+    });
+
+    it('does not oversell released inventory when requests compete after expiration', async () => {
+      const vip = store.events
+        .find((event) => event.id === 'noche-salsa')
+        ?.ticketTypes.find((type) => type.id === 'salsa-vip');
+
+      if (!vip) {
+        throw new Error('Expected salsa-vip fixture');
+      }
+
+      vip.remaining = 2;
+      const expired = service.create({
+        eventId: 'noche-salsa',
+        items: [{ ticketTypeId: 'salsa-vip', quantity: 2 }],
+      });
+      jest.setSystemTime(new Date('2026-11-10T12:15:00.000Z'));
+
+      const request = () =>
+        service.create({
+          eventId: 'noche-salsa',
+          items: [{ ticketTypeId: 'salsa-vip', quantity: 2 }],
+        });
+      const results = await Promise.allSettled([
+        Promise.resolve().then(request),
+        Promise.resolve().then(request),
+      ]);
+
+      expect(expired.status).toBe('expired');
+      expect(
+        results.filter((result) => result.status === 'fulfilled'),
+      ).toHaveLength(1);
+      expect(
+        results.filter((result) => result.status === 'rejected'),
+      ).toHaveLength(1);
+      expect(vip.remaining).toBe(0);
+      expect(vip.remaining).toBeGreaterThanOrEqual(0);
+    });
+
+    it('serializes confirmation and expiration scheduled for the same instant', () => {
+      let order!: ReturnType<OrdersService['create']>;
+      let confirmationError: unknown;
+
+      // Register this callback first so both possible timer orderings are
+      // covered: confirm() still enforces the deadline synchronously.
+      setTimeout(() => {
+        try {
+          service.confirm(order.id, {
+            name: 'Ana Pérez',
+            email: 'ana@example.com',
+          });
+        } catch (error) {
+          confirmationError = error;
+        }
+      }, 15 * 60 * 1000);
+
+      order = service.create({
+        eventId: 'standup-uio',
+        items: [{ ticketTypeId: 'standup-mesa', quantity: 1 }],
+      });
+      const ticketType = store.events
+        .find((event) => event.id === 'standup-uio')
+        ?.ticketTypes.find((type) => type.id === 'standup-mesa');
+
+      jest.advanceTimersByTime(15 * 60 * 1000);
+
+      expect(confirmationError).toBeInstanceOf(BadRequestException);
+      expect(order.status).toBe('expired');
+      expect(ticketType?.remaining).toBe(25);
+
+      jest.runOnlyPendingTimers();
+      expect(ticketType?.remaining).toBe(25);
+    });
+
+    it('rejects confirmation at the deadline and releases inventory', () => {
+      const order = service.create({
+        eventId: 'standup-uio',
+        items: [{ ticketTypeId: 'standup-mesa', quantity: 1 }],
+      });
+      const ticketType = store.events
+        .find((event) => event.id === 'standup-uio')
+        ?.ticketTypes.find((type) => type.id === 'standup-mesa');
+
+      // Move the clock without running the timer to exercise the synchronous
+      // deadline check performed by confirm().
+      jest.setSystemTime(new Date('2026-11-10T12:15:00.000Z'));
+
+      expect(() =>
+        service.confirm(order.id, {
+          name: 'Ana Pérez',
+          email: 'ana@example.com',
+        }),
+      ).toThrow(
+        new BadRequestException(
+          'La orden expiró y las entradas reservadas fueron liberadas',
+        ),
+      );
+      expect(order.status).toBe('expired');
+      expect(ticketType?.remaining).toBe(25);
+    });
+
+    it('does not expire or release an order confirmed before the deadline', () => {
+      const order = service.create({
+        eventId: 'standup-uio',
+        items: [{ ticketTypeId: 'standup-mesa', quantity: 1 }],
+      });
+      const ticketType = store.events
+        .find((event) => event.id === 'standup-uio')
+        ?.ticketTypes.find((type) => type.id === 'standup-mesa');
+
+      jest.advanceTimersByTime(15 * 60 * 1000 - 1);
+      service.confirm(order.id, {
+        name: 'Ana Pérez',
+        email: 'ana@example.com',
+      });
+      jest.advanceTimersByTime(1);
+
+      expect(order.status).toBe('confirmed');
+      expect(ticketType?.remaining).toBe(24);
     });
   });
 });

@@ -67,9 +67,13 @@ Vuelve algo así:
   "feeCents": 500,
   "totalCents": 5500,
   "buyer": null,
-  "createdAt": "2026-09-16T20:00:00.000Z"
+  "createdAt": "2026-09-16T20:00:00.000Z",
+  "expiresAt": "2026-09-16T20:15:00.000Z"
 }
 ```
+
+La reserva dura 15 minutos. Si no se confirma antes de `expiresAt`, la orden
+pasa a `expired` y las entradas se devuelven al inventario.
 
 ## `GET /orders/:id`
 
@@ -84,3 +88,4 @@ Acá se manda quién compra:
 ```
 
 La orden vuelve con `status: "confirmed"` y `buyer` lleno.
+Una orden `expired` no se puede confirmar y responde `400`.

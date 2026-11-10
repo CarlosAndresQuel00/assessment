@@ -16,7 +16,7 @@ export type EventRecord = {
   ticketTypes: TicketType[];
 };
 
-export type OrderStatus = 'pending' | 'confirmed';
+export type OrderStatus = 'pending' | 'confirmed' | 'expired';
 
 export type OrderItem = {
   ticketTypeId: string;
@@ -41,6 +41,7 @@ export type Order = {
   totalCents: number;
   buyer: Buyer | null;
   createdAt: string;
+  expiresAt: string;
 };
 
 export function createCatalog(): EventRecord[] {
